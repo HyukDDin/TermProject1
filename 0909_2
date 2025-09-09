@@ -1,0 +1,11 @@
+import pandas as pd
+
+# 데이터 경로를 확인하세요.
+ratings_df = pd.read_csv('./data/ratings.csv')
+movies_df = pd.read_csv('./data/movies.csv')
+
+print("--- MovieLens Ratings Data ---")
+display(ratings_df.head()) # display()는 노트북에서 표를 예쁘게 보여줍니다.
+
+print("\n--- MovieLens Movies Data ---")
+display(movies_df.head())
