@@ -1,0 +1,43 @@
+import requests
+import pandas as pd
+import time
+
+# P.S. API 키는 개인 키이므로 앞으로 스크린샷 등을 공유할 때 모자이크 처리하는 것이 좋습니다! :)
+API_KEY = "스크린샷에_있던_본인_API_KEY"
+BASE_URL = "https://api.themoviedb.org/3"
+
+# 1. 여러 페이지(20p)를 돌며 인기 영화의 기본 정보를 가져옵니다.
+movie_ids = []
+for page in range(1, 21):
+    url = f"{BASE_URL}/movie/popular?api_key={API_KEY}&language=ko-KR&page={page}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        data = response.json()
+        for movie in data.get("results", []):
+            movie_ids.append(movie['id']) # 영화 ID만 리스트에 저장
+        print(f"{page} 페이지 로딩 완료...")
+        time.sleep(0.5) # API 서버 부하를 줄이기 위한 딜레이
+    else:
+        print(f"Error on page {page}: {response.status_code}")
+        break
+
+print(f"✅ 총 {len(movie_ids)}개의 영화 ID 수집 완료")
+
+# 2. 위에서 수집한 ID를 이용해 각 영화의 상세 정보를 가져옵니다.
+movie_details = []
+for movie_id in movie_ids:
+    url = f"{BASE_URL}/movie/{movie_id}?api_key={API_KEY}&language=ko-KR"
+    response = requests.get(url)
+    if response.status_code == 200:
+        movie_details.append(response.json())
+        print(f"ID {movie_id} 영화 상세 정보 로딩 완료...")
+        time.sleep(0.5)
+    else:
+        print(f"Error on movie ID {movie_id}: {response.status_code}")
+
+# 3. 상세 정보가 담긴 데이터를 DataFrame으로 만들고 CSV로 저장합니다.
+df_details = pd.DataFrame(movie_details)
+df_details.to_csv("movies_details.csv", index=False, encoding="utf-8-sig")
+
+print("✅ movies_details.csv 저장 완료")
+print(df_details.head())
