@@ -1,0 +1,82 @@
+import pandas as pd
+import requests
+import time
+import re
+
+# --- 1부: API에서 '영어'와 '한글' 데이터를 모두 가져오기 ---
+API_KEY = "173b049b49a48893e151ad9e2c4968df" # 본인의 API 키를 사용하세요
+BASE_URL = "https://api.themoviedb.org/3"
+
+def fetch_popular_movies(language):
+    """지정된 언어로 인기 영화 20 페이지를 가져오는 함수"""
+    all_movies = []
+    print(f"TMDB에서 인기 영화 20 페이지를 '{language}'로 가져옵니다...")
+    for page in range(1, 21):
+        url = f"{BASE_URL}/movie/popular?api_key={API_KEY}&language={language}&page={page}"
+        response = requests.get(url)
+        if response.status_code == 200:
+            movies = response.json().get("results", [])
+            all_movies.extend(movies)
+            time.sleep(0.3)
+        else:
+            break
+    print(f"✅ {len(all_movies)}편의 '{language}' 영화 데이터를 가져왔습니다.")
+    return pd.DataFrame(all_movies)
+
+# 영어판과 한글판 데이터를 각각 가져옵니다.
+en_movies_df = fetch_popular_movies('en-US')
+ko_movies_df = fetch_popular_movies('ko-KR')
+
+# 'id'를 기준으로 두 데이터를 합쳐, 영어/한글 제목을 모두 가진 마스터 데이터를 만듭니다.
+# 필요한 컬럼만 선택해서 합칩니다.
+tmdb_master_df = pd.merge(
+    en_movies_df[['id', 'title', 'vote_average', 'vote_count']],
+    ko_movies_df[['id', 'title']],
+    on='id',
+    suffixes=('_en', '_ko') # 컬럼 이름 뒤에 _en, _ko를 붙여 구분
+)
+
+
+# --- 2부: 데이터 합치고 모델 실행하기 ---
+
+# 기존 사용자 평점 데이터를 불러옵니다.
+ratings_df = pd.read_csv('data/ratings.csv')
+movies_meta_df = pd.read_csv('data/movies.csv')
+movie_ratings_df = pd.merge(ratings_df, movies_meta_df, on='movieId')
+
+# 데이터 병합을 위해 제목을 깨끗하게 정제합니다.
+movie_ratings_df['title_clean'] = movie_ratings_df['title'].str.replace(r'\s*\(\d{4}\)$', '', regex=True).str.lower().str.strip()
+tmdb_master_df['title_clean'] = tmdb_master_df['title_en'].str.lower().str.strip()
+
+# 깨끗해진 영어 제목('title_clean')을 기준으로 최종 병합합니다.
+final_df = pd.merge(movie_ratings_df, tmdb_master_df, on='title_clean')
+print(f"\n✅ 데이터 병합 성공! {len(final_df['title'].unique())}편의 공통 영화를 찾았습니다.")
+
+
+# --- 3부: 모델 실행 및 결과 출력 ---
+
+C = final_df['vote_average'].mean()
+m = final_df['vote_count'].quantile(0.70)
+
+def weighted_rating(x, m=m, C=C):
+    v = x['vote_count']
+    R = x['vote_average']
+    return (v / (v + m) * R) + (m / (v + m) * C)
+
+final_df['weighted_rating'] = final_df.apply(weighted_rating, axis=1)
+
+recommendations = final_df.sort_values('weighted_rating', ascending=False)
+recommendations = recommendations.drop_duplicates(subset='title_ko') # 한글 제목 기준 중복 제거
+
+# 컬럼 이름을 바꾸고 평점 형식을 지정합니다.
+recommendations.rename(columns={
+    'title_ko': '영화 제목',
+    'vote_average': 'TMDB 평점',
+    'vote_count': '평가 수',
+    'weighted_rating': '가중 평점'
+}, inplace=True)
+recommendations['TMDB 평점'] = recommendations['TMDB 평점'].apply(lambda score: f"{score:.2f} / 10")
+
+
+print("\n🏆 최종 추천 리스트 (한글 제목 Ver.)")
+display(recommendations[['영화 제목', 'TMDB 평점', '평가 수', '가중 평점']].head(10))
