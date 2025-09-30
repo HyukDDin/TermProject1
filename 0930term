@@ -1,0 +1,124 @@
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# 모델 2에 사용할 영화 목록을 준비합니다.
+# final_df에서 중복된 영화를 제거하고, 한글 제목과 장르만 남깁니다.
+movies_df = final_df.drop_duplicates(subset='title_ko').copy()
+movies_df = movies_df[['title_ko', 'genres']].set_index('title_ko')
+
+# '|'로 연결된 장르를 공백으로 바꿔줍니다. (예: 'Action|Adventure' -> 'Action Adventure')
+movies_df['genres'] = movies_df['genres'].str.replace('|', ' ', regex=False)
+
+# TF-IDF 벡터화를 실행합니다.
+# TfidfVectorizer는 텍스트(장르)에서 중요한 키워드를 추출하여 숫자 벡터로 변환하는 기술입니다.
+tfidf_vectorizer = TfidfVectorizer()
+tfidf_matrix = tfidf_vectorizer.fit_transform(movies_df['genres'])
+
+print("✅ TF-IDF 행렬 생성 완료!")
+print(f"분석할 영화 수: {tfidf_matrix.shape[0]}편, 고유 장르 수: {tfidf_matrix.shape[1]}개")
+
+from surprise import Dataset, Reader
+from surprise.model_selection import train_test_split
+
+# 1. Surprise 라이브러리가 읽을 수 있도록 데이터 형식을 준비합니다.
+#    'rating' 컬럼의 범위를 지정해줍니다. (예: 0.5 ~ 5.0점)
+reader = Reader(rating_scale=(0.5, 5.0))
+
+# 2. 'userId', 'movieId', 'rating_x'(사용자 평점) 컬럼만 사용하여 데이터를 로드합니다.
+data = Dataset.load_from_df(final_df[['userId', 'movieId', 'rating']], reader)
+
+# 3. 데이터를 훈련 세트와 테스트 세트로 분리합니다.
+#    모델의 성능을 평가하기 위한 과정입니다.
+trainset, testset = train_test_split(data, test_size=0.2, random_state=42)
+
+print("✅ Surprise 라이브러리용 데이터 준비 완료!")
+
+from surprise import SVD
+from surprise import accuracy
+
+# 1. SVD 알고리즘 모델을 선언합니다.
+algo = SVD()
+
+# 2. 훈련 데이터(trainset)를 사용하여 모델을 훈련시킵니다.
+print("모델 훈련을 시작합니다...")
+algo.fit(trainset)
+print("모델 훈련 완료!")
+
+# 3. 테스트 데이터(testset)에 대한 예측을 수행합니다.
+predictions = algo.test(testset)
+
+# RMSE를 계산하여 모델의 예측 정확도를 평가합니다.
+print("\\n## 모델 성능 평가 (RMSE)")
+accuracy.rmse(predictions)
+
+def get_recommendations(user_id, n=10):
+    # 1. 사용자가 이미 평가한 영화들의 ID를 가져옵니다.
+    rated_movies = final_df[final_df['userId'] == user_id]['movieId'].tolist()
+
+    # 2. 전체 영화 목록에서 사용자가 이미 본 영화를 제외합니다.
+    all_movies = final_df['movieId'].unique()
+    unrated_movies = [movie for movie in all_movies if movie not in rated_movies]
+
+    # 3. 아직 안 본 영화들에 대해 예상 평점을 예측합니다.
+    predictions = [algo.predict(user_id, movie_id) for movie_id in unrated_movies]
+
+    # 4. 예상 평점이 높은 순으로 정렬합니다.
+    predictions.sort(key=lambda x: x.est, reverse=True)
+
+    # 5. 상위 n개의 추천 영화 ID를 가져옵니다.
+    top_n_predictions = predictions[:n]
+    recommended_movie_ids = [pred.iid for pred in top_n_predictions]
+
+    # 6. 영화 ID를 실제 한글 제목과 장르로 바꿔서 반환합니다.
+    recommended_movies = final_df[final_df['movieId'].isin(recommended_movie_ids)][['title_ko', 'genres']]
+    
+    # 중복을 제거하고 컬럼 이름을 지정하여 반환합니다.
+    final_recommendations = recommended_movies.drop_duplicates(subset='title_ko').set_index('title_ko')
+    final_recommendations.index.name = '영화 제목'
+    final_recommendations.columns = ['장르']
+    
+    return final_recommendations
+
+# --- 함수 테스트 ---
+# user_id=550 부분을 원하는 사용자 ID로 바꿔서 실행하세요.
+user_id_to_recommend = 550
+print(f"🏆 {user_id_to_recommend}번 사용자를 위한 맞춤 영화 추천 Top 10")
+display(get_recommendations(user_id=user_id_to_recommend, n=10))
+
+# CSV 정리: movies_details.csv → movies_details_clean.csv
+import pandas as pd
+from ast import literal_eval
+import os
+
+CSV_PATH = r"C:\Users\soft88\Desktop\텀프\movies_details.csv"  # 절대경로로 고정
+df = pd.read_csv(CSV_PATH)
+
+# 결측치 채우기
+for col in ["genres", "keywords", "director", "cast", "overview", "title"]:
+    if col in df.columns:
+        df[col] = df[col].fillna("")
+
+# 리스트처럼 저장된 문자열을 실제 리스트로 변환
+def to_list(x):
+    if isinstance(x, list):
+        return x
+    s = str(x).strip()
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            return list(map(str, literal_eval(s)))
+        except:
+            pass
+    # 콤마/슬래시로 대충 나뉘어 있으면 분리
+    return [t.strip() for t in s.replace("/", ",").split(",") if t.strip()]
+
+for col in ["genres", "keywords", "cast"]:
+    if col in df.columns:
+        df[col] = df[col].apply(to_list)
+
+# 중복 제거
+if "id" in df.columns:
+    df = df.drop_duplicates(subset="id", keep="first")
+
+CLEAN_PATH = r"C:\Users\soft88\Desktop\텀프\movies_details_clean.csv"
+df.to_csv(CLEAN_PATH, index=False, encoding="utf-8-sig")
+print("✅ 저장 완료:", CLEAN_PATH, df.shape)
+df.head(3)
