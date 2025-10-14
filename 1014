@@ -1,0 +1,134 @@
+# content_recommender.py
+import os
+import re
+import pandas as pd
+from ast import literal_eval
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ─────────────────────────────────────────
+# 0) 데이터 로드 (clean 있으면 우선 사용, 없으면 원본 사용)
+# ─────────────────────────────────────────
+HERE = os.path.dirname(__file__)
+CANDIDATES = ["movies_details_clean.csv", "movies_details.csv"]
+
+def _read_first_existing():
+    for name in CANDIDATES:
+        path = os.path.join(HERE, name)
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            print(f"📄 loaded: {path} -> {df.shape}")
+            return df, path
+    raise FileNotFoundError("movies_details_clean.csv 또는 movies_details.csv 파일이 폴더에 없습니다.")
+
+df, LOADED_PATH = _read_first_existing()
+
+# ─────────────────────────────────────────
+# 1) 전처리 유틸
+# ─────────────────────────────────────────
+def to_list(x):
+    """문자열로 저장된 리스트/구분자 데이터를 리스트로 변환"""
+    if isinstance(x, list):
+        return x
+    s = str(x).strip()
+    if not s:
+        return []
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            val = literal_eval(s)
+            if isinstance(val, list):
+                return [str(t) for t in val]
+        except:
+            pass
+    # 콤마/슬래시/파이프로 구분된 경우
+    return [t.strip() for t in re.split(r"[,/|]", s) if t.strip()]
+
+# 결측치 채우기
+for col in ["genres", "keywords", "cast", "director", "overview", "title"]:
+    if col in df.columns:
+        df[col] = df[col].fillna("")
+
+# 리스트형으로 정규화
+df["genres"]   = df.get("genres", "").apply(to_list)
+df["keywords"] = df.get("keywords", "").apply(to_list)
+df["cast"]     = df.get("cast", "").apply(to_list)
+df["director"] = df.get("director", "").astype(str)
+
+# 추천용 통합 텍스트
+df["combined_features"] = (
+    df["genres"].apply(" ".join) + " " +
+    df["keywords"].apply(" ".join) + " " +
+    df["director"] + " " +
+    df["cast"].apply(" ".join) + " " +
+    df.get("overview", "").astype(str)
+)
+
+# ─────────────────────────────────────────
+# 2) TF-IDF & 코사인 유사도
+#   - 한국어가 많으니 stop_words=None 권장
+#   - 작은 데이터셋이라 min_df=1
+# ─────────────────────────────────────────
+vectorizer = TfidfVectorizer(stop_words=None, min_df=1, ngram_range=(1, 2))
+tfidf = vectorizer.fit_transform(df["combined_features"])
+cosine_sim = cosine_similarity(tfidf, tfidf)
+
+# ─────────────────────────────────────────
+# 3) 검색/추천 함수
+# ─────────────────────────────────────────
+def search_titles(q, top=20):
+    """부분 일치로 제목 검색"""
+    q = str(q).strip().lower()
+    hits = df[df["title"].astype(str).str.lower().str.contains(re.escape(q), na=False)]["title"] \
+           .dropna().unique().tolist()
+    return hits[:top]
+
+def _find_idx(title):
+    """제목 완전/부분 일치로 인덱스 찾기"""
+    q = str(title).strip().lower()
+    exact = df.index[df["title"].astype(str).str.lower() == q]
+    if len(exact):
+        return int(exact[0])
+    partial = df.index[df["title"].astype(str).str.lower().str.contains(re.escape(q), na=False)]
+    if len(partial):
+        return int(partial[0])
+    return None
+
+def recommend_by_content(title, top_n=10, include_scores=False):
+    """제목 하나를 기준으로 비슷한 영화 Top-N 추천"""
+    idx = _find_idx(title)
+    if idx is None:
+        examples = search_titles("", 10)
+        return f"❌ 제목을 못 찾았어요: {title}\n   예시: {examples}"
+    sims = list(enumerate(cosine_sim[idx]))
+    sims = sorted(sims, key=lambda x: x[1], reverse=True)
+    sims = [s for s in sims if s[0] != idx][:top_n]   # 자기 자신 제외
+    rec_idx = [i for i, _ in sims]
+    cols = [c for c in ["title", "genres", "vote_average", "release_date"] if c in df.columns]
+    out = df.iloc[rec_idx][cols].reset_index(drop=True).copy()
+    if include_scores:
+        out["similarity"] = [score for _, score in sims]
+    return out
+
+# ─────────────────────────────────────────
+# 4) 단독 실행 테스트
+# ─────────────────────────────────────────
+if __name__ == "__main__":
+    # 샘플 / 검색 체크
+    print("\n샘플 10개 제목:", df["title"].dropna().head(10).tolist())
+    print("검색 예시('판타스틱'):", search_titles("판타스틱"))
+    print("검색 예시('귀멸'):", search_titles("귀멸"))
+    print("검색 예시('우주전쟁'):", search_titles("우주전쟁"))
+
+    # 보기 좋게 출력하는 헬퍼
+    def show(x, title):
+        print(f"\n[추천 예시] '{title}' 기준")
+        if hasattr(x, "to_string"):
+            print(x.to_string(index=False))   # 표를 강제로 전체 문자열로 출력
+        else:
+            print(x)
+
+    # 데이터셋에 실제 존재하는 제목으로 호출
+    show(recommend_by_content("판타스틱", 5, include_scores=True), "판타스틱")
+    show(recommend_by_content("귀멸", 5, include_scores=True), "귀멸")
+    show(recommend_by_content("우주전쟁", 5, include_scores=True), "우주전쟁")
+
