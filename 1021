@@ -1,0 +1,265 @@
+# app.py — 영화 추천 (Content-based) + 카드/모달 + 필터/정렬 + CSV
+# 실행: streamlit run app.py
+
+from pathlib import Path
+from ast import literal_eval
+import re
+
+import pandas as pd
+import streamlit as st
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+st.set_page_config(page_title="영화 추천 시스템", page_icon="🎬", layout="wide")
+
+# -------------------------------
+# 0) CSV 경로 (clean 우선)
+# -------------------------------
+HERE = Path(__file__).parent
+CSV_PATH = (HERE / "movies_details_clean.csv") if (HERE / "movies_details_clean.csv").exists() else (HERE / "movies_details.csv")
+if not CSV_PATH.exists():
+    st.error("CSV 파일이 없습니다. app.py와 같은 폴더에 movies_details_clean.csv 또는 movies_details.csv를 두세요.")
+    st.stop()
+
+# -------------------------------
+# 1) 데이터 로드/정제
+# -------------------------------
+@st.cache_data
+def load_df(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+
+    # 결측치
+    for col in ["genres","keywords","cast","director","overview","title","poster_path","release_date","vote_average"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("")
+
+    # 문자열 리스트 정규화
+    def to_list(x):
+        if isinstance(x, list):
+            return x
+        s = str(x).strip()
+        if not s:
+            return []
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                v = literal_eval(s)
+                if isinstance(v, list):
+                    return [str(t) for t in v]
+            except:
+                pass
+        return [t.strip() for t in re.split(r"[,/|]", s) if t.strip()]
+
+    if "genres"   in df.columns: df["genres"]   = df["genres"].apply(to_list)
+    if "keywords" in df.columns: df["keywords"] = df["keywords"].apply(to_list)
+    if "cast"     in df.columns: df["cast"]     = df["cast"].apply(to_list)
+
+    # 추천용 텍스트 (가중치 적용)
+    df["combined_features"] = (
+        (df["genres"].apply(" ".join)   + " ") * 3 +   # 장르 가중치
+        (df["keywords"].apply(" ".join) + " ") * 2 +   # 키워드 가중치
+        (df["director"].astype(str)     + " ") * 2 +   # 감독 가중치
+        (df["cast"].apply(" ".join)     + " ") * 1 +   # 배우
+        df["overview"].astype(str)                       # 줄거리
+    )
+
+    # 연도 파생
+    df["release_year"] = pd.to_datetime(df.get("release_date", ""), errors="coerce").dt.year.fillna(0).astype(int)
+    return df
+
+df = load_df(CSV_PATH)
+st.caption(f"읽은 파일: {CSV_PATH.name} | 포스터 수: {(df['poster_path'].astype(str)!='').sum() if 'poster_path' in df.columns else 0}")
+
+# -------------------------------
+# 2) TF-IDF + 코사인 유사도
+# -------------------------------
+@st.cache_resource
+def build_model(corpus):
+    vec = TfidfVectorizer(stop_words=None, min_df=1, ngram_range=(1, 2))
+    X = vec.fit_transform(corpus)
+    sim = cosine_similarity(X, X)
+    return vec, sim
+
+_, cosine_sim = build_model(df["combined_features"])
+
+# -------------------------------
+# 3) 추천 함수
+# -------------------------------
+def recommend_by_index(idx: int, k: int = 10) -> pd.DataFrame:
+    sims = sorted(enumerate(cosine_sim[idx]), key=lambda x: x[1], reverse=True)
+    sims = [s for s in sims if s[0] != idx][:k]           # 자기 자신 제외
+    rec_idx = [i for i, _ in sims]
+
+    cols = ["id","title","genres","vote_average","release_date","release_year","poster_path","overview"]
+    cols = [c for c in cols if c in df.columns]
+    out = df.iloc[rec_idx][cols].reset_index(drop=True).copy()
+
+    if "genres" in out.columns:
+        out["genres"] = out["genres"].apply(lambda xs: ", ".join(xs) if isinstance(xs, list) else str(xs))
+    if "vote_average" in out.columns:
+        out["vote_average"] = pd.to_numeric(out["vote_average"], errors="coerce").round(1)
+
+    if "poster_path" in out.columns:
+        base = "https://image.tmdb.org/t/p/w185"
+        out["poster_url"] = out["poster_path"].apply(lambda p: base + p if isinstance(p, str) and p else None)
+
+    out["similarity"] = [score for _, score in sims]
+    out["similarity"] = out["similarity"].round(3)
+    return out
+
+# ---- 상세 '모달' 호환: st.modal 없으면 사이드바로 표시 ----
+def show_detail_modal(row: pd.Series):
+    # st.modal이 있는 버전이면 모달, 없으면 사이드바 사용
+    has_modal = hasattr(st, "modal")
+
+    def _body(container):
+        url = row.get("poster_url") or "https://via.placeholder.com/185x278?text=No+Image"
+        container.image(url, use_container_width=True)
+
+        meta = []
+        if pd.notna(row.get("release_date")) and row.get("release_date"):
+            meta.append(f"개봉: {row['release_date']}")
+        if "vote_average" in row:
+            meta.append(f"⭐ {row['vote_average']}")
+        if meta:
+            container.write(" | ".join(meta))
+
+        if row.get("genres"):
+            container.write(row["genres"])
+
+        if isinstance(row.get("overview"), str) and row["overview"].strip():
+            container.markdown("---")
+            container.write(row["overview"])
+
+        if "id" in row.index and pd.notna(row["id"]):
+            tmdb_url = f"https://www.themoviedb.org/movie/{int(row['id'])}"
+            container.markdown(f"[TMDB에서 보기]({tmdb_url})")
+
+        if container.button("닫기", key="close_detail"):
+            st.session_state["open_modal"] = False
+            st.session_state["detail_idx"] = None
+            # 버전별 rerun 호환
+            try:
+                st.rerun()
+            except Exception:
+                st.experimental_rerun()
+
+    if has_modal:
+        with st.modal(row.get("title", "상세 보기")):
+            _body(st)
+    else:
+        st.sidebar.markdown(f"### {row.get('title','상세 보기')}")
+        _body(st.sidebar)
+
+
+# -------------------------------
+# 5) 세션 상태 초기화
+# -------------------------------
+st.session_state.setdefault("result", None)
+st.session_state.setdefault("open_modal", False)
+st.session_state.setdefault("detail_idx", None)
+st.session_state.setdefault("selected_title", "")
+
+# -------------------------------
+# 6) UI 컨트롤
+# -------------------------------
+st.title("🎬 영화 추천 시스템 (Content-based)")
+
+# 필터
+all_genres = sorted({g for gs in df["genres"] for g in (gs if isinstance(gs, list) else [])})
+sel_genres = st.multiselect("장르 필터", options=all_genres)
+
+year_min = int(df["release_year"].replace(0, pd.NA).min() or 1900)
+year_max = int(df["release_year"].max() or 2100)
+f_year = st.slider("개봉 연도", min_value=year_min, max_value=year_max, value=(year_min, year_max))
+f_vote = st.slider("평점 하한", 0.0, 10.0, 0.0, 0.5)
+sort_by = st.radio("정렬", ["유사도", "평점"], horizontal=True)
+
+# 검색/선택
+left, right = st.columns([2,1])
+with left:
+    all_titles = sorted(df["title"].dropna().unique().tolist())
+    hint = st.text_input("빠른 검색(부분 일치)")
+    list_for_select = [t for t in all_titles if (hint.lower() in t.lower())] if hint else all_titles
+    selected_title = st.selectbox("영화 제목 선택(타이핑해서 검색 가능)", options=list_for_select)
+    st.session_state["selected_title"] = selected_title
+with right:
+    k = st.slider("추천 개수", 5, 20, 10)
+
+# -------------------------------
+# 7) 추천 버튼 → 세션에 저장 후 rerun
+# -------------------------------
+if st.button("추천 보기"):
+    base_idx = int(df.index[df["title"] == st.session_state["selected_title"]][0])
+    result = recommend_by_index(base_idx, k).copy()
+
+    # 필터/정렬 적용
+    if "release_year" not in result.columns and "release_date" in result.columns:
+        result["release_year"] = pd.to_datetime(result["release_date"], errors="coerce").dt.year
+    if "vote_average" in result.columns:
+        result["vote_average"] = pd.to_numeric(result["vote_average"], errors="coerce").fillna(0)
+
+    if sel_genres:
+        result = result[result["genres"].apply(
+            lambda s: set(sel_genres).issubset(set(map(str.strip, s.split(","))))
+            if isinstance(s, str) else False
+        )]
+    if "release_year" in result.columns:
+        result = result[result["release_year"].between(f_year[0], f_year[1])]
+    if "vote_average" in result.columns:
+        result = result[result["vote_average"] >= f_vote]
+
+    if sort_by == "평점" and "vote_average" in result.columns:
+        result = result.sort_values("vote_average", ascending=False)
+    result = result.reset_index(drop=True)
+
+    st.session_state["result"] = result
+    st.session_state["open_modal"] = False
+    st.session_state["detail_idx"] = None
+    st.rerun()
+
+# -------------------------------
+# 8) 결과 카드 렌더링 + 다운로드
+# -------------------------------
+result = st.session_state.get("result")
+if isinstance(result, pd.DataFrame) and not result.empty:
+    cols = st.columns(5)
+    placeholder = "https://via.placeholder.com/185x278?text=No+Image"
+    for i, row in result.iterrows():
+        with cols[i % 5]:
+            url = row.get("poster_url") or placeholder
+            st.image(url, use_container_width=True)
+            st.caption(row["title"])
+            meta = []
+            if "vote_average" in row: meta.append(f"⭐ {row['vote_average']}")
+            meta.append(f"유사도 {row['similarity']}")
+            st.write(" | ".join(meta))
+            if "genres" in row: st.write(row["genres"])
+            if st.button("상세보기", key=f"detail_{i}"):
+                st.session_state["open_modal"] = True
+                st.session_state["detail_idx"] = i
+                st.rerun()
+
+    csv = result.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "CSV로 저장",
+        data=csv,
+        file_name=f"recommend_{st.session_state.get('selected_title','selection')}.csv",
+        mime="text/csv",
+        type="primary",
+    )
+
+# -------------------------------
+# 9) 모달 표시 (세션 상태 기반)
+# -------------------------------
+if st.session_state.get("open_modal") and st.session_state.get("detail_idx") is not None:
+    i = st.session_state["detail_idx"]
+    if isinstance(st.session_state.get("result"), pd.DataFrame) and 0 <= i < len(st.session_state["result"]):
+        row = st.session_state["result"].iloc[i]
+        show_detail_modal(row)
+
+# -------------------------------
+# 10) 데이터 샘플
+# -------------------------------
+with st.expander("데이터 샘플 보기"):
+    base_cols = [c for c in ["title","genres","vote_average","release_date","poster_path"] if c in df.columns]
+    st.dataframe(df[base_cols].head(10))
