@@ -1,4 +1,3 @@
-# content_recommender.py
 import os
 import re
 import pandas as pd
@@ -7,7 +6,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 # ─────────────────────────────────────────
-# 0) 데이터 로드 (clean 있으면 우선 사용, 없으면 원본 사용)
+# 0) 데이터 로드
 # ─────────────────────────────────────────
 HERE = os.path.dirname(__file__)
 CANDIDATES = ["movies_details_clean.csv", "movies_details.csv"]
@@ -24,10 +23,46 @@ def _read_first_existing():
 df, LOADED_PATH = _read_first_existing()
 
 # ─────────────────────────────────────────
-# 1) 전처리 유틸
+# 1) 데이터 점검 및 기본 통계
+# ─────────────────────────────────────────
+print("\n[기본 정보]")
+print("행(row), 열(column) 수:", df.shape)
+print("\n[기술통계 요약]")
+print(df.describe(include="all").T.head(10))  # 앞부분만 보기 좋게
+
+# ─────────────────────────────────────────
+# 2) 결측치 점검 및 처리
+# ─────────────────────────────────────────
+print("\n[결측치 개수 확인]")
+print(df.isnull().sum())
+
+# 결측치가 절반 이상인 열 제거
+df.dropna(axis=1, thresh=len(df)*0.5, inplace=True)
+print("\n➡ 50% 이상 결측치 열 제거 후:", df.shape)
+
+# 결측치는 공백 문자열로 채우기
+fill_cols = ["genres", "keywords", "cast", "director", "overview", "title"]
+for col in fill_cols:
+    if col in df.columns:
+        df[col].fillna("", inplace=True)
+
+# ─────────────────────────────────────────
+# 3) 문자열 정리 (strip, lower, upper, replace)
+# ─────────────────────────────────────────
+if "title" in df.columns:
+    # 공백 제거
+    df["title"] = df["title"].astype(str).str.strip()
+    # 모든 제목을 소문자로 저장
+    df["title_lower"] = df["title"].str.lower()
+    # 대문자 버전도 참고용으로 추가
+    df["title_upper"] = df["title"].str.upper()
+    # 불필요한 특수문자 예시 치환
+    df["title"] = df["title"].replace(r"[^0-9A-Za-z가-힣\s]", "", regex=True)
+
+# ─────────────────────────────────────────
+# 4) 리스트형 데이터 정규화
 # ─────────────────────────────────────────
 def to_list(x):
-    """문자열로 저장된 리스트/구분자 데이터를 리스트로 변환"""
     if isinstance(x, list):
         return x
     s = str(x).strip()
@@ -40,95 +75,95 @@ def to_list(x):
                 return [str(t) for t in val]
         except:
             pass
-    # 콤마/슬래시/파이프로 구분된 경우
     return [t.strip() for t in re.split(r"[,/|]", s) if t.strip()]
 
-# 결측치 채우기
-for col in ["genres", "keywords", "cast", "director", "overview", "title"]:
+for col in ["genres", "keywords", "cast"]:
     if col in df.columns:
-        df[col] = df[col].fillna("")
+        df[col] = df[col].apply(to_list)
 
-# 리스트형으로 정규화
-df["genres"]   = df.get("genres", "").apply(to_list)
-df["keywords"] = df.get("keywords", "").apply(to_list)
-df["cast"]     = df.get("cast", "").apply(to_list)
-df["director"] = df.get("director", "").astype(str)
-
-# 추천용 통합 텍스트
-df["combined_features"] = (
-    df["genres"].apply(" ".join) + " " +
-    df["keywords"].apply(" ".join) + " " +
-    df["director"] + " " +
-    df["cast"].apply(" ".join) + " " +
-    df.get("overview", "").astype(str)
-)
+if "director" in df.columns:
+    df["director"] = df["director"].astype(str).str.strip()
 
 # ─────────────────────────────────────────
-# 2) TF-IDF & 코사인 유사도
-#   - 한국어가 많으니 stop_words=None 권장
-#   - 작은 데이터셋이라 min_df=1
+# 5) 통합 텍스트 컬럼 생성
+# ─────────────────────────────────────────
+df["combined_features"] = (
+    df.get("genres", "").apply(" ".join) + " " +
+    df.get("keywords", "").apply(" ".join) + " " +
+    df.get("director", "") + " " +
+    df.get("cast", "").apply(" ".join) + " " +
+    df.get("overview", "").astype(str)
+).str.strip()
+
+# ─────────────────────────────────────────
+# 6) TF-IDF + 코사인 유사도
 # ─────────────────────────────────────────
 vectorizer = TfidfVectorizer(stop_words=None, min_df=1, ngram_range=(1, 2))
 tfidf = vectorizer.fit_transform(df["combined_features"])
 cosine_sim = cosine_similarity(tfidf, tfidf)
 
 # ─────────────────────────────────────────
-# 3) 검색/추천 함수
+# 7) 기본 통계 (mean, max, min, sort_values)
+# ─────────────────────────────────────────
+if "vote_average" in df.columns:
+    print("\n[평점 통계]")
+    print(f"평균: {df['vote_average'].mean():.2f}")
+    print(f"최고: {df['vote_average'].max():.2f}")
+    print(f"최저: {df['vote_average'].min():.2f}")
+
+    # 평점 높은 상위 5개
+    print("\n[평점 상위 5개 영화]")
+    print(df.sort_values(by="vote_average", ascending=False)[["title", "vote_average"]].head(5))
+
+# ─────────────────────────────────────────
+# 8) 검색 / 추천 함수
 # ─────────────────────────────────────────
 def search_titles(q, top=20):
-    """부분 일치로 제목 검색"""
     q = str(q).strip().lower()
-    hits = df[df["title"].astype(str).str.lower().str.contains(re.escape(q), na=False)]["title"] \
-           .dropna().unique().tolist()
+    hits = df[df["title_lower"].str.contains(re.escape(q), na=False)]["title"].dropna().unique().tolist()
     return hits[:top]
 
 def _find_idx(title):
-    """제목 완전/부분 일치로 인덱스 찾기"""
     q = str(title).strip().lower()
-    exact = df.index[df["title"].astype(str).str.lower() == q]
+    exact = df.index[df["title_lower"] == q]
     if len(exact):
         return int(exact[0])
-    partial = df.index[df["title"].astype(str).str.lower().str.contains(re.escape(q), na=False)]
+    partial = df.index[df["title_lower"].str.contains(re.escape(q), na=False)]
     if len(partial):
         return int(partial[0])
     return None
 
 def recommend_by_content(title, top_n=10, include_scores=False):
-    """제목 하나를 기준으로 비슷한 영화 Top-N 추천"""
     idx = _find_idx(title)
     if idx is None:
         examples = search_titles("", 10)
         return f"❌ 제목을 못 찾았어요: {title}\n   예시: {examples}"
     sims = list(enumerate(cosine_sim[idx]))
     sims = sorted(sims, key=lambda x: x[1], reverse=True)
-    sims = [s for s in sims if s[0] != idx][:top_n]   # 자기 자신 제외
+    sims = [s for s in sims if s[0] != idx][:top_n]
     rec_idx = [i for i, _ in sims]
     cols = [c for c in ["title", "genres", "vote_average", "release_date"] if c in df.columns]
     out = df.iloc[rec_idx][cols].reset_index(drop=True).copy()
     if include_scores:
         out["similarity"] = [score for _, score in sims]
-    return out
+    return out.sort_values(by="vote_average", ascending=False)  # 평점순 정렬
 
 # ─────────────────────────────────────────
-# 4) 단독 실행 테스트
+# 9) 단독 실행 테스트
 # ─────────────────────────────────────────
 if __name__ == "__main__":
-    # 샘플 / 검색 체크
     print("\n샘플 10개 제목:", df["title"].dropna().head(10).tolist())
     print("검색 예시('판타스틱'):", search_titles("판타스틱"))
     print("검색 예시('귀멸'):", search_titles("귀멸"))
     print("검색 예시('우주전쟁'):", search_titles("우주전쟁"))
 
-    # 보기 좋게 출력하는 헬퍼
     def show(x, title):
         print(f"\n[추천 예시] '{title}' 기준")
         if hasattr(x, "to_string"):
-            print(x.to_string(index=False))   # 표를 강제로 전체 문자열로 출력
+            print(x.to_string(index=False))
         else:
             print(x)
 
-    # 데이터셋에 실제 존재하는 제목으로 호출
     show(recommend_by_content("판타스틱", 5, include_scores=True), "판타스틱")
     show(recommend_by_content("귀멸", 5, include_scores=True), "귀멸")
     show(recommend_by_content("우주전쟁", 5, include_scores=True), "우주전쟁")
-
