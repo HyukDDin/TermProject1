@@ -4,6 +4,7 @@
 from pathlib import Path
 from ast import literal_eval
 import re
+import os, requests, urllib.parse
 
 import pandas as pd
 import streamlit as st
@@ -105,16 +106,49 @@ def recommend_by_index(idx: int, k: int = 10) -> pd.DataFrame:
     out["similarity"] = [score for _, score in sims]
     out["similarity"] = out["similarity"].round(3)
     return out
+# ---- YouTube 예고편 URL 가져오기 (API 키 없으면 None) ----
+@st.cache_data(show_spinner=False, ttl=60*60*24)
+def fetch_youtube_trailer_url(title: str, year: int | None = None) -> str | None:
+    """YouTube Data API v3로 '<제목> trailer (year)' 검색 → 첫 영상 URL"""
+    api_key = os.environ.get("YOUTUBE_API_KEY") or st.secrets.get("YOUTUBE_API_KEY", None)
+    if not api_key:
+        return None
+    try:
+        q = f"{title} trailer{f' {year}' if year else ''}"
+        params = {
+            "part": "snippet", "q": q, "type": "video",
+            "maxResults": 1, "regionCode": "KR",
+            "key": api_key, "safeSearch": "none",
+        }
+        r = requests.get("https://www.googleapis.com/youtube/v3/search", params=params, timeout=10)
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        if items:
+            vid = items[0]["id"]["videoId"]
+            return f"https://www.youtube.com/watch?v={vid}"
+    except Exception:
+        pass
+    return None
 
-# ---- 상세 '모달' 호환: st.modal 없으면 사이드바로 표시 ----
+
+# ---- 상세 '모달' 호환: st.modal 없으면 사이드바로 표시 + 유튜브 예고편 ----
 def show_detail_modal(row: pd.Series):
-    # st.modal이 있는 버전이면 모달, 없으면 사이드바 사용
-    has_modal = hasattr(st, "modal")
+    has_modal = hasattr(st, "modal")  # 최신 스트림릿은 모달 지원
+
+    # 연도(예고편 검색 정확도 ↑)
+    year = None
+    if isinstance(row.get("release_date"), str) and row["release_date"].strip():
+        try:
+            year = int(pd.to_datetime(row["release_date"], errors="coerce").year)
+        except Exception:
+            year = None
 
     def _body(container):
+        # 포스터
         url = row.get("poster_url") or "https://via.placeholder.com/185x278?text=No+Image"
         container.image(url, use_container_width=True)
 
+        # 메타
         meta = []
         if pd.notna(row.get("release_date")) and row.get("release_date"):
             meta.append(f"개봉: {row['release_date']}")
@@ -122,22 +156,32 @@ def show_detail_modal(row: pd.Series):
             meta.append(f"⭐ {row['vote_average']}")
         if meta:
             container.write(" | ".join(meta))
-
         if row.get("genres"):
             container.write(row["genres"])
 
+        # 줄거리
         if isinstance(row.get("overview"), str) and row["overview"].strip():
             container.markdown("---")
             container.write(row["overview"])
 
+        # TMDB 링크
         if "id" in row.index and pd.notna(row["id"]):
             tmdb_url = f"https://www.themoviedb.org/movie/{int(row['id'])}"
             container.markdown(f"[TMDB에서 보기]({tmdb_url})")
 
+        # 🎞️ 유튜브 예고편
+        container.markdown("### 🎞️ 예고편")
+        yt_url = fetch_youtube_trailer_url(row.get("title", ""), year)
+        if yt_url:
+            container.video(yt_url)
+        else:
+            q = urllib.parse.quote(f"{row.get('title','')} trailer {year or ''}")
+            container.link_button("YouTube에서 예고편 검색", f"https://www.youtube.com/results?search_query={q}")
+
+        # 닫기
         if container.button("닫기", key="close_detail"):
             st.session_state["open_modal"] = False
             st.session_state["detail_idx"] = None
-            # 버전별 rerun 호환
             try:
                 st.rerun()
             except Exception:
@@ -149,6 +193,7 @@ def show_detail_modal(row: pd.Series):
     else:
         st.sidebar.markdown(f"### {row.get('title','상세 보기')}")
         _body(st.sidebar)
+
 
 
 # -------------------------------
