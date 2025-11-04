@@ -1,4 +1,10 @@
 # --- [Auth Block] SQLite + Passlib 해시 + Streamlit 인증 UI -------------------
+# 이 모듈은 "로그인/회원가입"과 "개인화/관리자"에 필요한
+# 1) SQLite 스키마/CRUD
+# 2) 비밀번호 해시/검증(passlib.bcrypt)
+# 3) Streamlit 로그인/회원가입 UI
+# 를 한 번에 제공한다.
+
 import sqlite3
 import time
 import re
@@ -6,17 +12,19 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 
 import streamlit as st
-from passlib.hash import bcrypt  # 안전한 비밀번호 저장을 위한 해시 함수 (검증은 verify)
+from passlib.hash import bcrypt  # 비밀번호를 안전하게 해시/검증하는 라이브러리
 
-DB_PATH = "users.db"
+DB_PATH = "users.db"  # 애플리케이션 로컬 DB 파일 경로
+
 
 # ---------------------------------------------------------------------
 # 0) DB 연결 도우미
 # ---------------------------------------------------------------------
 def _conn() -> sqlite3.Connection:
     """
-    SQLite 커넥션을 생성한다.
-    - check_same_thread=False : Streamlit이 멀티스레드처럼 콜백을 실행할 수 있어 안전하게 공유.
+    [역할] SQLite 커넥션을 생성하는 헬퍼.
+    - check_same_thread=False : Streamlit 콜백/위젯이 여러 스레드처럼 불리는 상황에서
+      같은 커넥션을 안전히 재사용하기 위한 옵션.
     """
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
@@ -26,48 +34,50 @@ def _conn() -> sqlite3.Connection:
 # ---------------------------------------------------------------------
 def init_db() -> None:
     """
-    테이블이 없으면 생성하고, 기본 admin 계정을 보장한다.
+    [역할] 앱 최초 실행 시 테이블이 없으면 생성하고,
+          기본 admin 계정(아이디: admin, 비번: admin123)을 보장한다.
+    - 운영 배포 시에는 admin 비밀번호를 강하게 바꾸는 것이 필수!
     """
     con = _conn()
     cur = con.cursor()
 
-    # 회원 테이블
+    # [테이블] 사용자 계정 정보
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,  -- 내부 식별자(PK)
         username TEXT UNIQUE NOT NULL,         -- 로그인 아이디(영문/숫자/언더스코어 3~20)
         email    TEXT UNIQUE,                  -- 이메일(선택)
-        password_hash TEXT NOT NULL,           -- bcrypt 해시 저장
+        password_hash TEXT NOT NULL,           -- bcrypt 해시 저장(평문 저장 금지!)
         role TEXT DEFAULT 'user',              -- 권한: 'user' | 'admin'
         created_at TEXT,                       -- 가입 시각(UTC ISO8601)
         last_login TEXT                        -- 마지막 로그인 시각(UTC ISO8601)
     )
     """)
 
-    # 영화 평점 테이블
+    # [테이블] 사용자의 영화 평점(개인화 추천용 데이터)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS user_ratings (
         user_id INTEGER NOT NULL,              -- 평점을 남긴 사용자
-        movie_id INTEGER NOT NULL,             -- 영화 ID(네 데이터 기준)
+        movie_id INTEGER NOT NULL,             -- 영화 ID(데이터셋 기준)
         rating REAL NOT NULL,                  -- 0.5~5.0 사이 점수 권장
         rated_at TEXT,                         -- 평가 시각(UTC ISO8601)
-        PRIMARY KEY (user_id, movie_id)        -- 동일 영화 중복 평가 방지
+        PRIMARY KEY (user_id, movie_id)        -- 동일 영화 중복 평가 방지(복합 PK)
     )
     """)
 
-    # 즐겨찾기(북마크) 테이블
+    # [테이블] 사용자의 즐겨찾기(북마크)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS user_favorites (
         user_id INTEGER NOT NULL,
         movie_id INTEGER NOT NULL,
         created_at TEXT,
-        PRIMARY KEY (user_id, movie_id)
+        PRIMARY KEY (user_id, movie_id)        -- 동일 영화 중복 북마크 방지
     )
     """)
 
     con.commit()
 
-    # 기본 admin 계정이 없으면 생성
+    # [시드 데이터] 기본 admin 계정이 없으면 생성
     cur.execute("SELECT 1 FROM users WHERE username = ?", ("admin",))
     if not cur.fetchone():
         cur.execute(
@@ -75,7 +85,7 @@ def init_db() -> None:
             (
                 "admin",
                 "admin@example.com",
-                bcrypt.hash("admin123"),          # 주의: 실제 배포 시 강한 비밀번호로 변경
+                bcrypt.hash("admin123"),          # (주의) 데모용. 실제 서비스에서는 반드시 변경!
                 "admin",
                 datetime.utcnow().isoformat() + "Z"
             )
@@ -86,12 +96,12 @@ def init_db() -> None:
 
 
 # ---------------------------------------------------------------------
-# 2) 사용자 관련 쿼리/유틸
+# 2) 사용자 관련 쿼리/유틸 (CRUD + 유효성 검사)
 # ---------------------------------------------------------------------
 def user_by_username(username: str) -> Optional[Dict[str, Any]]:
     """
-    username으로 사용자 1명을 조회한다.
-    반환: dict or None
+    [역할] username으로 사용자 1명을 조회.
+    - 반환: dict(일치 시) / None(없으면)
     """
     con = _conn()
     cur = con.cursor()
@@ -110,8 +120,9 @@ def user_by_username(username: str) -> Optional[Dict[str, Any]]:
 
 def create_user(username: str, email: Optional[str], password: str) -> None:
     """
-    신규 사용자 생성 (비밀번호는 반드시 해시로 저장).
-    - UNIQUE 제약으로 username/email 중복 시 sqlite3.IntegrityError 발생
+    [역할] 신규 사용자 생성.
+    - 비밀번호는 bcrypt.hash로 해시 저장(평문 절대 금지)
+    - username/email UNIQUE 제약 → 중복 시 sqlite3.IntegrityError 발생
     """
     con = _conn()
     cur = con.cursor()
@@ -124,7 +135,9 @@ def create_user(username: str, email: Optional[str], password: str) -> None:
 
 
 def update_last_login(uid: int) -> None:
-    """성공적으로 로그인한 시각을 기록한다."""
+    """
+    [역할] 로그인 성공 시 마지막 로그인 시간을 갱신(감사/보안용 로그).
+    """
     con = _conn()
     cur = con.cursor()
     cur.execute("UPDATE users SET last_login=? WHERE id=?", (datetime.utcnow().isoformat() + "Z", uid))
@@ -133,28 +146,32 @@ def update_last_login(uid: int) -> None:
 
 
 def valid_username(u: str) -> bool:
-    """아이디 형식: 영문/숫자/언더스코어 3~20자."""
+    """
+    [역할] 아이디 형식 검사.
+    - 허용: 영문/숫자/언더스코어, 길이 3~20
+    """
     return bool(re.fullmatch(r"[a-zA-Z0-9_]{3,20}", u))
 
 
 def strong_pw(p: str) -> bool:
     """
-    비밀번호 간단 강도 체크:
+    [역할] 비밀번호 최소 강도 검사(간단 버전).
     - 8자 이상
     - 영문 1개 이상
     - 숫자 1개 이상
-    (추가로 특수문자, 대문자 등을 요구하고 싶으면 정규식 강화)
+    (필요 시 특수문자/대문자 조건을 더 추가해 강화 가능)
     """
     return len(p) >= 8 and re.search(r"[A-Za-z]", p) and re.search(r"\d", p)
 
 
 # ---------------------------------------------------------------------
-# 3) (선택) 평점/즐겨찾기 helper — UI/추천 시스템과의 연결용
+# 3) (선택) 평점/즐겨찾기 helper — 추천 시스템과의 연결 지점
 # ---------------------------------------------------------------------
 def set_rating(user_id: int, movie_id: int, rating: float) -> None:
     """
-    사용자 평점을 저장/갱신한다.
-    - 동일 (user_id, movie_id)는 PK로 중복 불가 → UPSERT를 위해 REPLACE 전략 사용
+    [역할] 사용자의 영화 평점을 저장/갱신.
+    - (user_id, movie_id) 복합 PK로 중복 불가
+    - UPSERT: 이미 있으면 점수/시간만 업데이트
     """
     con = _conn()
     cur = con.cursor()
@@ -170,8 +187,9 @@ def set_rating(user_id: int, movie_id: int, rating: float) -> None:
 
 def toggle_favorite(user_id: int, movie_id: int) -> bool:
     """
-    즐겨찾기를 토글한다.
-    - 이미 있으면 삭제(False 반환), 없으면 추가(True 반환)
+    [역할] 즐겨찾기(북마크) 토글.
+    - 이미 있으면 삭제하고 False 반환
+    - 없으면 추가하고 True 반환
     """
     con = _conn()
     cur = con.cursor()
@@ -194,18 +212,19 @@ def toggle_favorite(user_id: int, movie_id: int) -> bool:
 
 
 # ---------------------------------------------------------------------
-# 4) Streamlit 인증 게이트
+# 4) Streamlit 인증 게이트 (로그인/회원가입 UI + 세션 관리)
 # ---------------------------------------------------------------------
 def show_auth_gate() -> bool:
     """
-    로그인/회원가입 UI를 렌더링하고, 성공 시 st.session_state['auth_user']에
-    최소 정보(id, username, email, role, created_at, last_login)를 담는다.
-
-    반환: True(인증 완료) / False(미인증)
+    [역할] 로그인/회원가입 화면을 렌더링하고,
+          로그인에 성공하면 st.session_state['auth_user']에 최소 정보만 저장.
+    - 반환 True  : 현재 로그인 상태(인증됨)
+    - 반환 False : 아직 로그인 전(미인증)
     """
+    # 세션에 인증 사용자 객체 보관(없으면 None)
     st.session_state.setdefault("auth_user", None)
 
-    # 이미 로그인 상태라면 상단 바 + 로그아웃
+    # [이미 로그인된 상태] 상단 환영 메시지 + 로그아웃 버튼 표시
     if st.session_state["auth_user"]:
         u = st.session_state["auth_user"]
         colL, colR = st.columns([3, 1], vertical_alignment="center")
@@ -213,11 +232,11 @@ def show_auth_gate() -> bool:
             st.success(f"👋 {u['username']} 님 환영합니다! (role: {u['role']})")
         with colR:
             if st.button("로그아웃"):
-                st.session_state["auth_user"] = None
-                st.rerun()
+                st.session_state["auth_user"] = None  # 세션에서 사용자 제거
+                st.rerun()                            # 화면 갱신
         return True
 
-    # 로그인/회원가입 탭
+    # [미로그인 상태] → 로그인/회원가입 탭 UI
     st.markdown("### 🔐 로그인 / 회원가입")
     tab_login, tab_join = st.tabs(["로그인", "회원가입"])
 
@@ -231,11 +250,11 @@ def show_auth_gate() -> bool:
             if not user:
                 st.error("존재하지 않는 사용자입니다.")
             elif not bcrypt.verify(login_pw, user["password_hash"]):
-                # 중요: 비밀번호 평문 비교 금지. 반드시 verify로 검증.
+                # (중요) 평문 비교 금지. 반드시 bcrypt.verify() 사용
                 st.error("비밀번호가 올바르지 않습니다.")
             else:
                 update_last_login(user["id"])
-                # 세션에 공개 가능한 최소 필드만 저장(해시 값 제외!)
+                # 세션에는 공개 가능한 최소 필드만 저장(해시 같은 민감정보 배제)
                 st.session_state["auth_user"] = {
                     k: user[k] for k in ("id", "username", "email", "role", "created_at", "last_login")
                 }
@@ -269,7 +288,7 @@ def show_auth_gate() -> bool:
                 except Exception as e:
                     st.error(f"회원가입 실패: {e}")
 
-    return False
+    return False  # 여기까지 오면 아직 인증되지 않음
 
 
 # ---------------------------------------------------------------------
@@ -277,13 +296,15 @@ def show_auth_gate() -> bool:
 # ---------------------------------------------------------------------
 def render_personal_reco_section(recommend_for_user_func) -> None:
     """
-    recommend_for_user_func: callable(user_id:int, top_k:int) -> pandas.DataFrame
-      - 최소 컬럼: ['title', 'poster_url'] (없으면 placeholder로 대체)
+    [역할] '✨ 나를 위한 개인화 추천' 버튼과 카드 그리드 UI.
+    - recommend_for_user_func(user_id:int, top_k:int) -> pandas.DataFrame
+      * 최소 컬럼: ['title', 'poster_url'] (없으면 placeholder로 대체)
+    - 세션의 로그인 사용자 ID를 넘겨 외부 추천 모듈과 연결한다.
     """
     user = st.session_state.get("auth_user")
 
     if user and st.button("✨ 나를 위한 개인화 추천 보기"):
-        # 외부 모듈의 추천 함수를 호출 (예: 협업/콘텐츠 기반 혼합 모델)
+        # 외부 추천 함수 호출(협업/콘텐츠 기반/하이브리드 등 원하는 구현체)
         df = recommend_for_user_func(user["id"], top_k=20)
 
         if df is None or getattr(df, "empty", True):
@@ -304,8 +325,9 @@ def render_personal_reco_section(recommend_for_user_func) -> None:
 # ---------------------------------------------------------------------
 def render_admin() -> None:
     """
-    관리자 전용의 간단한 카운트 대시보드.
-    - 접근 조건: 로그인 + role == 'admin'
+    [역할] 관리자 전용 미니 대시보드.
+    - 접근 조건: 로그인되어 있고 role == 'admin'
+    - 보여주는 지표: 가입자 수 / 평가 수 / 즐겨찾기 수
     """
     user = st.session_state.get("auth_user")
     if not (user and user.get("role") == "admin"):
@@ -314,6 +336,7 @@ def render_admin() -> None:
 
     st.subheader("👑 관리자 대시보드 (라이트)")
 
+    # 간단한 집계 쿼리
     con = _conn()
     cur = con.cursor()
     cur.execute("SELECT COUNT(*) FROM users"); users_n = cur.fetchone()[0]
@@ -321,6 +344,7 @@ def render_admin() -> None:
     cur.execute("SELECT COUNT(*) FROM user_favorites"); fav_n = cur.fetchone()[0]
     con.close()
 
+    # 카드형 메트릭 UI
     c1, c2, c3 = st.columns(3)
     c1.metric("가입자 수", users_n)
     c2.metric("평가 수", ratings_n)
@@ -330,15 +354,16 @@ def render_admin() -> None:
 # ---------------------------------------------------------------------
 # 7) 모듈 초기화(앱 시작 시 1회)
 # ---------------------------------------------------------------------
+# [역할] 애플리케이션이 import 되는 시점에 DB 스키마를 보장한다.
 init_db()
 
 # (예시) Streamlit 메인에서의 사용 방법:
 # --------------------------------------
-# authed = show_auth_gate()
+# authed = show_auth_gate()  # 1) 인증 게이트 호출
 # if authed:
-#     # 추천 섹션 (외부 추천 함수 주입)
+#     # 2) 추천 섹션(외부의 추천 함수 주입)
 #     render_personal_reco_section(recommend_for_user)
 #
-#     # 관리자 페이지
+#     # 3) 관리자 영역(관리자만)
 #     with st.expander("관리자 대시보드 열기"):
 #         render_admin()
