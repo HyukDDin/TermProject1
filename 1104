@@ -1,0 +1,269 @@
+# ============================================================
+# [검색기록 기반 추천] — 오늘 작업 모음 (주석 버전)
+#  - 검색어 로그 테이블 스키마
+#  - 검색어 기록/조회/삭제 유틸
+#  - TF-IDF 공간에서 검색어→영화 유사도 누적 추천
+#  - UI: 버튼, 최근검색 표시, 카드 그리드 렌더
+#  - (전제) vec, X, df 는 앱 상단에서 이미 구축됨 (TF-IDF, 코퍼스, 데이터프레임)
+# ============================================================
+
+# -------- 0) DB 연결 헬퍼 -------------------------------------------------------
+DB_PATH = "users.db"
+
+def _conn():
+    """SQLite 연결 핸들러(스레드 안전 옵션 포함)."""
+    import sqlite3
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+# -------- 1) init_db() 내에 추가/확인한 '검색 로그' 테이블 -------------------------
+def init_db():
+    """
+    앱 시작 시 한 번 호출.
+    이미 존재하면 그대로, 없으면 테이블 생성.
+    """
+    con = _conn(); cur = con.cursor()
+
+    # (기존 users / user_ratings / user_favorites 생성부 생략)
+    # ─────────────────────────────────────────────────────────
+
+    # ✅ 사용자 검색 로그 테이블
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS user_searches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,  -- 개별 로그 id
+        user_id INTEGER,                       -- 누가 검색했는지(로그인 안돼도 None 허용 가능)
+        query   TEXT NOT NULL,                 -- 검색어 자체(제목 선택/힌트 등)
+        searched_at TEXT                       -- UTC ISO8601 타임스탬프
+    )
+    """)
+    # 조회 속도 개선을 위한 보조 인덱스(사용자별 최신순)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_user_searches_user
+    ON user_searches(user_id, searched_at DESC)
+    """)
+
+    con.commit(); con.close()
+
+
+# -------- 2) 검색 로그 유틸 함수 3종 --------------------------------------------
+from datetime import datetime
+
+def log_search(user_id: int | None, query: str):
+    """
+    [쓰기] 검색/선택 이벤트를 한 줄씩 남긴다.
+    - user_id: 로그인 사용자 id (없으면 None 가능)
+    - query  : 사용자가 입력/선택한 검색 문자열
+    """
+    q = (query or "").strip()
+    if not q:
+        return  # 빈 문자열은 로깅하지 않음
+    con = _conn(); cur = con.cursor()
+    cur.execute(
+        "INSERT INTO user_searches (user_id, query, searched_at) VALUES (?,?,?)",
+        (user_id, q, datetime.utcnow().isoformat())
+    )
+    con.commit(); con.close()
+
+def get_recent_searches(user_id: int, limit: int = 20) -> list[str]:
+    """
+    [읽기] 최근 검색어를 최신순으로 가져온다.
+    - limit: 가져올 개수 (기본 20)
+    """
+    con = _conn(); cur = con.cursor()
+    cur.execute(
+        "SELECT query FROM user_searches WHERE user_id=? ORDER BY searched_at DESC LIMIT ?",
+        (user_id, limit)
+    )
+    rows = [r[0] for r in cur.fetchall()]
+    con.close()
+    return rows
+
+def clear_searches(user_id: int):
+    """[삭제] 내 검색 기록 전체 삭제."""
+    con = _conn(); cur = con.cursor()
+    cur.execute("DELETE FROM user_searches WHERE user_id=?", (user_id,))
+    con.commit(); con.close()
+
+
+# -------- 3) (전제) 추천에 필요한 전역(이미 앱 상단에서 준비됨) -------------------
+# vec: TfidfVectorizer.fit(corpus) 결과
+# X  : 문서-단어 TF-IDF 행렬 (모든 영화)
+# df : 영화 DataFrame (id, title, genres, vote_average, poster_path ...)
+
+# 예시)
+# vec = TfidfVectorizer(...).fit(corpus) ; X = vec.transform(corpus)
+# cosine_sim = cosine_similarity(X, X)
+
+
+# -------- 4) 검색기록 기반 추천 본체 --------------------------------------------
+import numpy as np
+import pandas as pd
+
+def recommend_from_search_history(user_id: int, top_k: int = 24) -> pd.DataFrame:
+    """
+    [핵심 알고리즘]
+    1) 사용자 최근 검색어 리스트를 가져온다.
+    2) 각 검색어를 TF-IDF 벡터로 변환 → 전체 영화 코퍼스(X)와 점곱으로 유사도 계산
+       (qv @ X.T)  : '검색어' vs '영화문서' 코사인 유사도(정규화된 TFIDF라면 점곱이 유사도에 해당)
+    3) '최근일수록' 더 큰 가중치(지수감쇠)로 누적 합산 → 최종 점수 벡터
+    4) 내가 이미 평점 남겼거나 즐겨찾기한 영화는 제외
+    5) 상위 top_k편을 DataFrame으로 반환
+    6) 시각화 편의를 위해 점수 0~1로 정규화 컬럼(search_score) 추가
+    """
+    # 3-1) 최근 검색어 수집
+    queries = get_recent_searches(user_id, limit=20)
+    if not queries:
+        return pd.DataFrame()
+
+    # 3-2) 최근 가중치(지수감쇠): 가장 최근 = 1.0, 한 스텝 멀어질수록 0.85배
+    weights, base, decay = [], 1.0, 0.85
+    for i in range(len(queries)):
+        weights.append(base * (decay ** i))
+
+    # 3-3) 검색어 유사도 누적 스코어
+    scores = np.zeros(X.shape[0], dtype=float)
+    for q, w in zip(queries, weights):
+        try:
+            qv = vec.transform([q])          # 검색어 → TF-IDF 벡터
+            sim_q = (qv @ X.T).toarray().ravel()  # 각 영화와의 유사도(벡터 점곱)
+            scores += sim_q * float(w)       # 가중 합산
+        except Exception:
+            # 변환 불가(이상 문자열 등) 시 해당 검색어는 건너뜀
+            continue
+
+    # 3-4) 이미 본 것(평점/즐겨찾기)은 추천 제외
+    seen = set(mid for mid, _ in get_ratings_by_user(user_id)) | get_favorites(user_id)
+    ids = df["id"].fillna(-1).astype(int).tolist() if "id" in df.columns else [-1] * len(df)
+
+    # 3-5) 점수 내림차순 정렬 후 top_k개 뽑기
+    order = np.argsort(-scores)
+    keep_idx = []
+    for i in order:
+        if ids[i] not in seen:            # 이미 본 것 제외
+            keep_idx.append(i)
+        if len(keep_idx) >= top_k:
+            break
+    if not keep_idx:
+        return pd.DataFrame()
+
+    # 3-6) 결과 표 생성(필요 칼럼만)
+    cols = ["id","title","genres","vote_average","release_date","poster_path","overview"]
+    out = df.iloc[keep_idx][cols].copy().reset_index(drop=True)
+
+    # 3-7) 표시용 가공(장르 문자열·포스터 URL·평점 반올림·검색점수 정규화)
+    if "genres" in out.columns:
+        out["genres"] = out["genres"].apply(lambda xs: ", ".join(xs) if isinstance(xs, list) else str(xs))
+    if "poster_path" in out.columns:
+        base_img = "https://image.tmdb.org/t/p/w342"  # 검색 추천은 조금 큰 썸네일
+        out["poster_url"] = out["poster_path"].apply(lambda p: base_img + p if isinstance(p, str) and p else None)
+    if "vote_average" in out.columns:
+        out["vote_average"] = pd.to_numeric(out["vote_average"], errors="coerce").round(1)
+
+    # 0~1 정규화 점수(시각화용)
+    raw = np.array([scores[i] for i in keep_idx], dtype=float)
+    norm = (raw - raw.min()) / (raw.max() - raw.min()) if raw.max() > raw.min() else np.zeros_like(raw)
+    out["search_score"] = np.round(norm, 3)
+
+    return out
+
+
+# -------- 5) 카드 그리드(UI) — 검색결과를 보기 좋게 렌더 ---------------------------
+import streamlit as st
+
+# (선택) 섹션/카드용 CSS — 제목 말줄임, 메타 글씨 크기 등
+st.markdown("""
+<style>
+.card-caption { text-align:center; font-size:0.95rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.card-meta    { text-align:center; font-size:0.85rem; opacity:.85; }
+.section-title{ font-size:2rem; font-weight:900; margin:.75rem 0 .5rem; display:flex; gap:.5rem; align-items:center; }
+</style>
+""", unsafe_allow_html=True)
+
+def render_card_grid(items_df: pd.DataFrame, key_prefix: str, *, n_cols: int = 6, score_col: str | None = None):
+    """
+    간결한 카드 그리드(썸네일, 제목 1줄, 메타 1줄, 상세보기 버튼).
+    - score_col: 'search_score' 같은 정규화 스코어 컬럼명이면 함께 표시.
+    """
+    if items_df is None or items_df.empty:
+        st.info("표시할 결과가 없습니다.")
+        return
+
+    cols = st.columns(n_cols)
+    ph = "https://via.placeholder.com/342x513?text=No+Image"
+
+    for i, row in items_df.reset_index(drop=True).iterrows():
+        with cols[i % n_cols]:
+            st.image(row.get("poster_url") or ph, use_container_width=True)
+            st.markdown(f'<div class="card-caption">{row.get("title","")}</div>', unsafe_allow_html=True)
+
+            vote_txt = f'⭐ {float(row["vote_average"]):.1f}' if pd.notna(row.get("vote_average")) else "⭐ -"
+            score_txt = f' | 점수 {float(row[score_col]):.3f}' if score_col and pd.notna(row.get(score_col)) else ""
+            st.markdown(f'<div class="card-meta">{vote_txt}{score_txt}</div>', unsafe_allow_html=True)
+
+            if st.button("상세보기", key=f"{key_prefix}_detail_{i}"):
+                # 상세 모달에서 사용할 데이터 연결
+                st.session_state["result"] = items_df
+                st.session_state["open_modal"] = True
+                st.session_state["detail_idx"] = i
+                st.rerun()
+
+
+# -------- 6) 추천 페이지에 붙이는 UI 조각 -----------------------------------------
+def render_recommend_section_for_search_history():
+    """
+    추천 페이지(render_recommend_page) 내부에서 호출하는 섹션.
+    - '내 검색기록 기반 추천' 버튼
+    - '검색기록 지우기' 버튼
+    - '최근 검색어' 미니 표시
+    - 결과는 위의 render_card_grid()로 4~6열 카드로 출력
+    """
+    st.markdown("---")
+    colA, colB, colC = st.columns([1,1,2])
+
+    user = st.session_state.get("auth_user")
+    user_id = user["id"] if user else None
+
+    with colA:
+        if user_id is not None and st.button("🔎 내 검색기록 기반 추천"):
+            rs = recommend_from_search_history(user_id, top_k=24)  # 넉넉히 뽑아서
+            if rs.empty:
+                st.info("검색 기록이 없거나 추천을 만들 수 없어요. 먼저 몇 번 검색/선택을 해보세요!")
+            else:
+                st.markdown("### 🔎 내 검색기록 기반 추천")
+                render_card_grid(rs, key_prefix="searchrec", n_cols=4, score_col="search_score")
+
+    with colB:
+        if user_id is not None and st.button("🗑️ 검색기록 지우기"):
+            clear_searches(user_id)
+            st.success("검색 기록을 모두 삭제했습니다.")
+
+    with colC:
+        if user_id is not None:
+            recent = get_recent_searches(user_id, limit=10)
+            if recent:
+                st.caption("최근 검색어: " + " · ".join(recent))
+
+
+# -------- 7) (중요) '추천 보기' 버튼 누를 때 검색어를 로그로 남기기 ---------------
+#  - render_recommend_page()의 '추천 보기' 처리 직전에 아래 코드 조각을 넣는다.
+#  - selected_title: selectbox로 고른 영화 제목
+#  - hint          : 텍스트 입력(부분 검색어)
+
+def _log_queries_when_click_recommend(selected_title: str | None, hint: str | None):
+    """
+    '추천 보기' 버튼 클릭 시 호출해 검색어/선택어를 로그에 저장.
+    """
+    user = st.session_state.get("auth_user")
+    user_id = user["id"] if user else None
+    if user_id is None:
+        return
+
+    if selected_title:
+        log_search(user_id, selected_title)
+    if hint:
+        log_search(user_id, hint)
+
+# (사용 예시)
+# if st.button("추천 보기"):
+#     _log_queries_when_click_recommend(selected_title, hint)
+#     ... (이후 기존 추천 로직 실행)
