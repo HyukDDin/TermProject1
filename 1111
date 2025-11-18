@@ -1,0 +1,231 @@
+-- =========================================================
+-- 1) 즐겨찾기 테이블 : user_favorites
+--    - "어떤 사용자가 어떤 영화를 즐겨찾기했는지" 저장
+-- =========================================================
+CREATE TABLE IF NOT EXISTS user_favorites (
+    user_id   INTEGER NOT NULL,  -- 사용자 번호
+    movie_id  INTEGER NOT NULL,  -- 영화 번호
+    created_at TEXT,             -- 즐겨찾기한 날짜/시간(문자열로 저장)
+    PRIMARY KEY (user_id, movie_id)  -- 같은 영화 즐겨찾기 중복 저장 방지
+);
+
+-- =========================================================
+-- 2) 관심없음 테이블 : user_dismissed
+--    - "어떤 사용자가 어떤 영화를 관심없음(숨김) 처리했는지" 저장
+-- =========================================================
+CREATE TABLE IF NOT EXISTS user_dismissed (
+    user_id   INTEGER NOT NULL,  -- 사용자 번호
+    movie_id  INTEGER NOT NULL,  -- 영화 번호
+    created_at TEXT,             -- 관심없음으로 표시한 날짜/시간
+    PRIMARY KEY (user_id, movie_id)  -- 같은 영화 중복 저장 방지
+);
+from datetime import datetime
+
+# -------------------------------------------
+# 2-1. get_favorites(user_id)
+#    → 이 사용자가 즐겨찾기한 영화 목록 가져오기
+# -------------------------------------------
+
+def get_favorites(user_id: int) -> set[int]:
+    """
+    주어진 user_id가 즐겨찾기한 영화들의 movie_id 집합을 돌려준다.
+
+    예) user_id = 1 이고
+        user_favorites에 (1,101), (1,205)가 들어있다면
+        {101, 205} 를 반환한다.
+    """
+    con = _conn()
+    cur = con.cursor()
+
+    # user_favorites 테이블에서 이 사용자의 영화 번호만 뽑기
+    cur.execute(
+        "SELECT movie_id FROM user_favorites WHERE user_id=?",
+        (user_id,)
+    )
+    # fetchall() 결과에서 첫 번째 칸(movie_id)만 뽑아서 set으로 변환
+    movie_ids = {int(row[0]) for row in cur.fetchall()}
+
+    con.close()
+    return movie_ids
+
+
+# -------------------------------------------
+# 2-2. toggle_favorite(user_id, movie_id)
+#    → 즐겨찾기 ON/OFF 토글
+# -------------------------------------------
+
+def toggle_favorite(user_id: int, movie_id: int) -> bool:
+    """
+    즐겨찾기를 '토글'하는 함수
+
+    - 만약 (user_id, movie_id)가 이미 테이블에 있으면 → 삭제(즐겨찾기 해제)
+      그리고 False를 리턴
+    - 없으면 → 새로 INSERT(즐겨찾기 추가)
+      그리고 True를 리턴
+
+    이렇게 하면 버튼 하나로 "즐겨찾기 추가 / 해제"를 모두 처리할 수 있다.
+    """
+    con = _conn()
+    cur = con.cursor()
+
+    # 1단계: 이미 즐겨찾기 되어 있는지 확인
+    cur.execute(
+        "SELECT 1 FROM user_favorites WHERE user_id=? AND movie_id=?",
+        (user_id, movie_id)
+    )
+    found = cur.fetchone()
+
+    if found:
+        # 이미 즐겨찾기 되어 있으면 → 삭제 = 즐겨찾기 해제
+        cur.execute(
+            "DELETE FROM user_favorites WHERE user_id=? AND movie_id=?",
+            (user_id, movie_id)
+        )
+        con.commit()
+        con.close()
+        return False  # 해제됨
+
+    # 기록이 없으면 → 새로 INSERT = 즐겨찾기 추가
+    cur.execute(
+        "INSERT INTO user_favorites (user_id, movie_id, created_at) VALUES (?,?,?)",
+        (user_id, movie_id, datetime.utcnow().isoformat())
+    )
+    con.commit()
+    con.close()
+    return True  # 새로 추가됨
+import streamlit as st
+
+# -------------------------------------------
+# 3-1. get_dismissed(user_id)
+#    → 이 사용자가 '관심없음'으로 표시한 영화 목록 가져오기
+# -------------------------------------------
+
+def get_dismissed(user_id: int) -> set[int]:
+    """
+    주어진 user_id가 '관심없음'으로 표시한 영화들의 movie_id 집합을 돌려준다.
+    """
+    con = _conn()
+    cur = con.cursor()
+
+    cur.execute(
+        "SELECT movie_id FROM user_dismissed WHERE user_id=?",
+        (user_id,)
+    )
+    movie_ids = {int(row[0]) for row in cur.fetchall()}
+
+    con.close()
+    return movie_ids
+
+
+# -------------------------------------------
+# 3-2. add_dismissed(movie_id)
+#    → 관심없음 추가 (화면에서 바로 숨기기 + DB에도 저장)
+# -------------------------------------------
+
+def add_dismissed(movie_id: int):
+    """
+    현재 로그인한 사용자를 기준으로,
+    1) 화면에서 바로 이 영화를 숨기고(세션에 기록)
+    2) DB(user_dismissed)에 '관심없음'으로 저장한다.
+    """
+
+    # 1) 화면에서 바로 숨기기 위해, 세션에 movie_id를 저장
+    #    - _dismiss : 이 세션에서 '숨겨야 할 영화 id' 모음
+    st.session_state.setdefault("_dismiss", set())
+    st.session_state["_dismiss"].add(int(movie_id))
+
+    # 2) 로그인한 사용자 정보 가져오기
+    user = st.session_state.get("auth_user")
+    if not user:
+        # 로그인 안 한 경우에는 DB에 저장하지 않고 화면에서만 숨김
+        return
+
+    # 3) DB에 관심없음 기록 저장
+    con = _conn()
+    cur = con.cursor()
+
+    # INSERT OR IGNORE :
+    #   같은 (user_id, movie_id)가 이미 있으면 무시 → 중복 방지
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO user_dismissed (user_id, movie_id, created_at)
+        VALUES (?,?,?)
+        """,
+        (int(user["id"]), int(movie_id), datetime.utcnow().isoformat())
+    )
+
+    con.commit()
+    con.close()
+
+
+# -------------------------------------------
+# 3-3. remove_dismissed(user_id, movie_id)
+#    → 관심없음 해제 (DB + 세션 둘 다에서 삭제)
+# -------------------------------------------
+
+def remove_dismissed(user_id: int, movie_id: int):
+    """
+    '관심없음'을 취소하는 함수
+
+    - DB의 user_dismissed 테이블에서 이 기록을 삭제하고
+    - 세션(_dismiss)에서도 이 movie_id를 제거한다.
+    그러면 추천 목록에 다시 이 영화가 나타날 수 있다.
+    """
+    # 1) DB에서 삭제
+    con = _conn()
+    cur = con.cursor()
+
+    cur.execute(
+        "DELETE FROM user_dismissed WHERE user_id=? AND movie_id=?",
+        (int(user_id), int(movie_id))
+    )
+    con.commit()
+    con.close()
+
+    # 2) 현재 세션에서도 제거 (화면 새로고침 시 다시 보이게)
+    st.session_state.setdefault("_dismiss", set())
+    st.session_state["_dismiss"].discard(int(movie_id))
+# ----------------------------------------------------------
+# 추천 알고리즘이 만든 결과 DataFrame: result
+#   - result["id"] : 영화의 movie_id
+#   - result에는 원래 추천된 영화들이 다 들어있다.
+# 아래 코드는 '관심없음'으로 표시한 영화는 빼고 보여주기 위해 사용한다.
+# ----------------------------------------------------------
+
+# 세션에 저장된 숨김 목록 가져오기 (예: {101, 205, 333} 이런 집합)
+dismissed = st.session_state.get("_dismiss", set())
+
+if "id" in result.columns and dismissed:
+    # result["id"]가 dismissed 집합에 속하는 영화는 모두 제거
+    result = result[~result["id"].astype(int).isin(dismissed)]
+    # 이렇게 해서 '관심없음'으로 표시한 영화는 추천 결과에 나타나지 않는다.
+# ----------------------------------------------------------
+# 추천 카드 한 장을 그릴 때 사용하는 예시 코드
+# - "★ 즐겨찾기" 버튼
+# - "관심없음" 버튼
+# 두 버튼을 통해 위에서 만든 함수들이 실제로 어떻게 쓰이는지 보여준다.
+# ----------------------------------------------------------
+
+user = st.session_state.get("auth_user")
+user_id = user["id"] if user else None
+
+mid = int(row.get("id") or -1)  # 현재 카드가 가리키는 영화의 movie_id
+
+# 작은 버튼들을 한 줄에 배치하는 예시
+col1, col2 = st.columns(2)
+
+with col1:
+    if st.button("★ 즐겨찾기", key=f"fav_{mid}"):
+        if user_id is not None and mid != -1:
+            added = toggle_favorite(user_id, mid)  # True면 추가, False면 해제
+            if added:
+                st.toast("즐겨찾기에 추가했습니다. ⭐")
+            else:
+                st.toast("즐겨찾기를 해제했습니다.", icon="❌")
+
+with col2:
+    if st.button("관심없음", key=f"dismiss_{mid}"):
+        if user_id is not None and mid != -1:
+            add_dismissed(mid)  # 세션 + DB에 관심없음 기록
+            st.toast("이 영화를 추천에서 숨겼습니다.", icon="🚫")
+            st.rerun()  # 즉시 화면 갱신
