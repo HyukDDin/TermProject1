@@ -1,0 +1,105 @@
+# 📌 검색어 저장
+def log_search(user_id, query):
+    """사용자가 검색한 키워드를 DB에 기록"""
+    q = query.strip()
+    if not q: return
+    con=_conn(); cur=con.cursor()
+    cur.execute(
+        "INSERT INTO user_searches (user_id, query, searched_at) VALUES (?,?,?)",
+        (user_id, q, datetime.utcnow().isoformat())
+    )
+    con.commit(); con.close()
+
+# 📌 최근 검색어 가져오기
+def get_recent_searches(user_id, limit=20):
+    """최근 검색어 n개 가져오기(최신순)"""
+    con=_conn(); cur=con.cursor()
+    cur.execute("""
+        SELECT query FROM user_searches
+        WHERE user_id=? ORDER BY searched_at DESC LIMIT ?
+    """,(user_id,limit))
+    rows = [r[0] for r in cur.fetchall()]
+    con.close()
+    return rows
+
+# 📌 검색기록 기반 추천
+def recommend_from_search_history(user_id, top_k=24):
+    """
+    최근 검색어 → TF-IDF 벡터화 → 영화들과 코사인 유사도 계산 → 가중치 반영 후 상위 추천
+    (유튜브 '최근 검색 기반 추천' 같은 방식)
+    """
+    queries = get_recent_searches(user_id)
+    if not queries: 
+        return pd.DataFrame()
+
+    # 최근일수록 가중치 ↑
+    weights = [0.85**i for i in range(len(queries))]
+    scores = np.zeros(X.shape[0])
+
+    for q, w in zip(queries, weights):
+        try:
+            q_vec = vec.transform([q])
+            sim = (q_vec @ X.T).toarray().ravel()
+            scores += sim * w
+        except: 
+            pass
+
+    # ‘관심없음’ 제외
+    dismissed = get_seen_movies(user_id)
+    movie_ids = df["id"].fillna(-1).astype(int).tolist()
+
+    # 점수 상위 top_k개만 추출
+    result_idx = []
+    for i in np.argsort(-scores):
+        if movie_ids[i] not in dismissed:
+            result_idx.append(i)
+        if len(result_idx) >= top_k: break
+
+    result = df.iloc[result_idx].copy().reset_index(drop=True)
+    result["similarity"] = ((scores[result_idx]-scores[result_idx].min())/
+                            (scores[result_idx].ptp()+1e-9)).round(3)
+    return result
+
+2.회원가입시 닉네임 저장하는 코드
+def create_user(username, email, password, nickname):
+    """회원가입 시 닉네임까지 함께 저장"""
+    con=_conn(); cur=con.cursor()
+    cur.execute("""
+        INSERT INTO users (username,email,password_hash,nickname,role,created_at)
+        VALUES (?,?,?,?,?,?)
+    """,(username,email,pwd_hash.hash(password),nickname,"user",
+         datetime.utcnow().isoformat()))
+    con.commit(); con.close()
+
+  3.로그인시 닉네임 정보 가져오기
+def user_by_username(username):
+    """로그인 시 nickname 포함해서 가져오기"""
+    con=_conn(); cur=con.cursor()
+    cur.execute("""
+        SELECT id,username,email,password_hash,nickname,role,created_at,last_login
+        FROM users WHERE username=?
+    """,(username,))
+    row=cur.fetchone(); con.close()
+    if row:
+        keys=["id","username","email","password_hash","nickname","role","created_at","last_login"]
+        return dict(zip(keys,row))
+    return None
+4.로그인 성공 후 세션에 nickname 저장
+    st.session_state["auth_user"] = {
+    k: user[k] for k in ("id","username","email","nickname","role","created_at","last_login")
+}
+5.내 페이지에서 닉네임 변경하기
+st.subheader("🙂 닉네임 변경")
+
+current_nick = user.get("nickname") or user["username"]
+new_nick = st.text_input("닉네임", value=current_nick)
+
+if st.button("저장"):
+    con=_conn(); cur=con.cursor()
+    cur.execute("UPDATE users SET nickname=? WHERE id=?",(new_nick.strip(),user["id"]))
+    con.commit(); con.close()
+
+    st.session_state["auth_user"]["nickname"] = new_nick.strip()
+    st.success("닉네임 저장 완료!")
+    st.rerun()
+
