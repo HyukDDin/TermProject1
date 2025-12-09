@@ -1,0 +1,161 @@
+# ============================================
+# UI: 영화 카드(Grid) + 액션 버튼 3개
+# ============================================
+
+def render_card_grid(items_df, key_prefix, n_cols=5, score_col=None):
+    """
+    영화 카드(포스터, 제목, 평점)와 버튼(상세보기·즐겨찾기·관심없음)을
+    그리드 형태로 표시하는 UI 렌더링 함수.
+    """
+
+    if items_df is None or items_df.empty:
+        st.info("표시할 영화가 없습니다.")
+        return
+
+    # -------------------------------
+    # 카드 & 버튼 CSS 스타일
+    # -------------------------------
+    st.markdown(
+        """
+        <style>
+        /* 카드 전체 박스 */
+        .card-box {
+            background: #111;
+            border-radius: 14px;
+            padding: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            transition: transform 0.25s ease, box-shadow 0.25s ease;
+            height: 100%;
+        }
+        .card-box:hover {
+            transform: scale(1.03);
+            box-shadow: 0 8px 20px rgba(0,0,0,0.6);
+        }
+
+        /* 포스터 이미지 */
+        .poster-img {
+            width: 100%;
+            border-radius: 10px;
+            aspect-ratio: 2/3;
+            object-fit: cover;
+        }
+
+        /* 영화 제목 */
+        .card-title {
+            margin-top: 8px;
+            font-size: 15px;
+            font-weight: 700;
+            color: #fff;
+            text-align: center;
+            height: 40px;
+            overflow: hidden;
+        }
+
+        /* 평점 표시 */
+        .card-meta {
+            color: #ccc;
+            font-size: 13px;
+            text-align: center;
+            margin-bottom: 6px;
+        }
+
+        /* 카드 하단 버튼 외형 */
+        .card-btn {
+            background: #1f1f1f;
+            border-radius: 16px;
+            border: 1px solid #444;
+            width: 3rem;
+            height: 3rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+        }
+
+        div.stButton > button:hover {
+            border-color: #ffcc00;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # 사용자 데이터
+    user = st.session_state.get("auth_user")
+    user_id = user["id"] if user else None
+    favorites = get_favorites(user_id) if user_id else set()
+    dismissed = get_dismissed(user_id) if user_id else set()
+
+    # -------------------------------
+    # 그리드 형태 카드 렌더링
+    # -------------------------------
+    cols = st.columns(n_cols)
+
+    for i, row in items_df.reset_index(drop=True).iterrows():
+        with cols[i % n_cols]:
+            mid = int(row["id"])
+            poster = row.get("poster_url") or "https://via.placeholder.com/342x513"
+            title = str(row["title"])
+            vote = row.get("vote_average", "-")
+            vote_str = f"{vote:.1f}" if isinstance(vote, (int, float)) else "-"
+
+            score_extra = ""
+            if score_col and score_col in row:
+                try:
+                    score_extra = f" · {float(row[score_col]):.3f}"
+                except:
+                    pass
+
+            # -----------------------------
+            # 영화 카드 HTML
+            # -----------------------------
+            st.markdown(
+                f"""
+                <div class="card-box">
+                    <img src="{poster}" class="poster-img">
+                    <div class="card-title">{title}</div>
+                    <div class="card-meta">⭐ {vote_str}{score_extra}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            # -----------------------------
+            # 하단 액션 버튼 3개 (정렬 중앙)
+            # -----------------------------
+            left, center, right = st.columns([1, 3, 1])
+            with center:
+                b1, b2, b3 = st.columns(3)
+
+                # 1) 상세보기 버튼
+                with b1:
+                    if st.button("🔍", key=f"{key_prefix}_detail_{i}"):
+                        st.session_state["result"] = items_df
+                        st.session_state["open_modal"] = True
+                        st.session_state["detail_idx"] = i
+                        st.rerun()
+
+                # 2) 즐겨찾기 버튼
+                with b2:
+                    if user_id:
+                        is_fav = mid in favorites
+                        fav_icon = "💛" if is_fav else "⭐"
+                        if st.button(fav_icon, key=f"{key_prefix}_fav_{i}"):
+                            toggle_favorite(user_id, mid)
+                            st.rerun()
+                    else:
+                        st.button("⭐", disabled=True)
+
+                # 3) 관심없음 버튼
+                with b3:
+                    if user_id:
+                        is_dis = mid in dismissed
+                        icon = "↩" if is_dis else "🚫"
+                        if st.button(icon, key=f"{key_prefix}_dis_{i}"):
+                            if is_dis:
+                                remove_dismissed(user_id, mid)
+                            else:
+                                add_dismissed(mid)
+                            st.rerun()
+                    else:
+                        st.button("🚫", disabled=True)
